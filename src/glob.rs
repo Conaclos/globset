@@ -21,16 +21,16 @@ use {new_regex, Candidate, Error, ErrorKind};
 pub enum MatchStrategy {
     /// A pattern matches if and only if the entire file path matches this
     /// literal string.
-    Literal(String),
+    Literal(Box<str>),
     /// A pattern matches if and only if the file path's basename matches this
     /// literal string.
-    BasenameLiteral(String),
+    BasenameLiteral(Box<str>),
     /// A pattern matches if and only if the file path's extension matches this
     /// literal string.
-    Extension(String),
+    Extension(Box<str>),
     /// A pattern matches if and only if this prefix literal is a prefix of the
     /// candidate file path.
-    Prefix(String),
+    Prefix(Box<str>),
     /// A pattern matches if and only if this prefix literal is a prefix of the
     /// candidate file path.
     ///
@@ -38,7 +38,7 @@ pub enum MatchStrategy {
     /// beginning of a file path or immediately following a `/`.
     Suffix {
         /// The actual suffix.
-        suffix: String,
+        suffix: Box<str>,
         /// Whether this must start at the beginning of a path component.
         component: bool,
     },
@@ -46,7 +46,7 @@ pub enum MatchStrategy {
     /// extension. Note that this is a necessary but NOT sufficient criterion.
     /// Namely, if the extension matches, then a full regex search is still
     /// required.
-    RequiredExtension(String),
+    RequiredExtension(Box<str>),
     /// A regex needs to be used for matching.
     Regex,
 }
@@ -55,17 +55,20 @@ impl MatchStrategy {
     /// Returns a matching strategy for the given pattern.
     pub fn new(pat: &Glob) -> MatchStrategy {
         if let Some(lit) = pat.basename_literal() {
-            MatchStrategy::BasenameLiteral(lit)
+            MatchStrategy::BasenameLiteral(lit.into_boxed_str())
         } else if let Some(lit) = pat.literal() {
-            MatchStrategy::Literal(lit)
+            MatchStrategy::Literal(lit.into_boxed_str())
         } else if let Some(ext) = pat.ext() {
-            MatchStrategy::Extension(ext)
+            MatchStrategy::Extension(ext.into_boxed_str())
         } else if let Some(prefix) = pat.prefix() {
-            MatchStrategy::Prefix(prefix)
+            MatchStrategy::Prefix(prefix.into_boxed_str())
         } else if let Some((suffix, component)) = pat.suffix() {
-            MatchStrategy::Suffix { suffix: suffix, component: component }
+            MatchStrategy::Suffix {
+                suffix: suffix.into_boxed_str(),
+                component: component,
+            }
         } else if let Some(ext) = pat.required_ext() {
-            MatchStrategy::RequiredExtension(ext)
+            MatchStrategy::RequiredExtension(ext.into_boxed_str())
         } else {
             MatchStrategy::Regex
         }
@@ -78,8 +81,8 @@ impl MatchStrategy {
 /// to a regular expression string or a matcher.
 #[derive(Clone, Debug, Eq)]
 pub struct Glob {
-    glob: String,
-    re: String,
+    glob: Box<str>,
+    re: Box<str>,
     opts: GlobOptions,
     tokens: Tokens,
 }
@@ -210,16 +213,38 @@ impl GlobOptions {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct Tokens(Vec<Token>);
+struct Tokens(Box<[Token]>);
 
 impl Deref for Tokens {
+    type Target = [Token];
+    fn deref(&self) -> &[Token] {
+        &self.0
+    }
+}
+
+impl DerefMut for Tokens {
+    fn deref_mut(&mut self) -> &mut [Token] {
+        &mut self.0
+    }
+}
+
+impl From<TokensBuilder> for Tokens {
+    fn from(value: TokensBuilder) -> Self {
+        Self(value.0.into_boxed_slice())
+    }
+}
+
+#[derive(Debug, Default)]
+struct TokensBuilder(Vec<Token>);
+
+impl Deref for TokensBuilder {
     type Target = Vec<Token>;
     fn deref(&self) -> &Vec<Token> {
         &self.0
     }
 }
 
-impl DerefMut for Tokens {
+impl DerefMut for TokensBuilder {
     fn deref_mut(&mut self) -> &mut Vec<Token> {
         &mut self.0
     }
@@ -233,8 +258,8 @@ enum Token {
     RecursivePrefix,
     RecursiveSuffix,
     RecursiveZeroOrMore,
-    Class { negated: bool, ranges: Vec<(char, char)> },
-    Alternates(Vec<Tokens>),
+    Class { negated: bool, ranges: Box<[(char, char)]> },
+    Alternates(Box<[Tokens]>),
 }
 
 impl Glob {
@@ -354,7 +379,7 @@ impl Glob {
         }
     }
 
-    /// This is like `ext`, but returns an extension even if it isn't sufficent
+    /// This is like `ext`, but returns an extension even if it isn't sufficient
     /// to imply a match. Namely, if an extension is returned, then it is
     /// necessary but not sufficient for a match.
     fn required_ext(&self) -> Option<String> {
@@ -562,7 +587,7 @@ impl<'a> GlobBuilder<'a> {
     pub fn build(&self) -> Result<Glob, Error> {
         let mut p = Parser {
             glob: &self.glob,
-            stack: vec![Tokens::default()],
+            stack: vec![TokensBuilder::default()],
             chars: self.glob.chars().peekable(),
             prev: None,
             cur: None,
@@ -582,10 +607,10 @@ impl<'a> GlobBuilder<'a> {
         } else {
             let tokens = p.stack.pop().unwrap();
             Ok(Glob {
-                glob: self.glob.to_string(),
-                re: tokens.to_regex_with(&self.opts),
+                glob: self.glob.to_string().into_boxed_str(),
+                re: tokens.to_regex_with(&self.opts).into_boxed_str(),
                 opts: self.opts,
-                tokens: tokens,
+                tokens: tokens.into(),
             })
         }
     }
@@ -618,7 +643,7 @@ impl<'a> GlobBuilder<'a> {
     }
 }
 
-impl Tokens {
+impl TokensBuilder {
     /// Convert this pattern to a string that is guaranteed to be a valid
     /// regular expression and will represent the matching semantics of this
     /// glob pattern and the options given.
@@ -737,7 +762,7 @@ fn bytes_to_escaped_literal(bs: &[u8]) -> String {
 
 struct Parser<'a> {
     glob: &'a str,
-    stack: Vec<Tokens>,
+    stack: Vec<TokensBuilder>,
     chars: iter::Peekable<str::Chars<'a>>,
     prev: Option<char>,
     cur: Option<char>,
@@ -769,15 +794,15 @@ impl<'a> Parser<'a> {
         if self.stack.len() > 1 {
             return Err(self.error(ErrorKind::NestedAlternates));
         }
-        Ok(self.stack.push(Tokens::default()))
+        Ok(self.stack.push(TokensBuilder::default()))
     }
 
     fn pop_alternate(&mut self) -> Result<(), Error> {
         let mut alts = vec![];
         while self.stack.len() >= 2 {
-            alts.push(self.stack.pop().unwrap());
+            alts.push(self.stack.pop().unwrap().into());
         }
-        self.push_token(Token::Alternates(alts))
+        self.push_token(Token::Alternates(alts.into_boxed_slice()))
     }
 
     fn push_token(&mut self, tok: Token) -> Result<(), Error> {
@@ -808,7 +833,7 @@ impl<'a> Parser<'a> {
         if self.stack.len() <= 1 {
             self.push_token(Token::Literal(','))
         } else {
-            Ok(self.stack.push(Tokens::default()))
+            Ok(self.stack.push(TokensBuilder::default()))
         }
     }
 
@@ -965,7 +990,10 @@ impl<'a> Parser<'a> {
             // it as a literal.
             ranges.push(('-', '-'));
         }
-        self.push_token(Token::Class { negated: negated, ranges: ranges })
+        self.push_token(Token::Class {
+            negated: negated,
+            ranges: ranges.into_boxed_slice(),
+        })
     }
 
     fn bump(&mut self) -> Option<char> {
@@ -1010,7 +1038,7 @@ mod tests {
             #[test]
             fn $name() {
                 let pat = Glob::new($pat).unwrap();
-                assert_eq!($tokens, pat.tokens.0);
+                assert_eq!($tokens.into_boxed_slice(), pat.tokens.0);
             }
         };
     }
@@ -1109,19 +1137,19 @@ mod tests {
     }
 
     fn class(s: char, e: char) -> Token {
-        Class { negated: false, ranges: vec![(s, e)] }
+        Class { negated: false, ranges: vec![(s, e)].into_boxed_slice() }
     }
 
     fn classn(s: char, e: char) -> Token {
-        Class { negated: true, ranges: vec![(s, e)] }
+        Class { negated: true, ranges: vec![(s, e)].into_boxed_slice() }
     }
 
     fn rclass(ranges: &[(char, char)]) -> Token {
-        Class { negated: false, ranges: ranges.to_vec() }
+        Class { negated: false, ranges: ranges.to_vec().into_boxed_slice() }
     }
 
     fn rclassn(ranges: &[(char, char)]) -> Token {
-        Class { negated: true, ranges: ranges.to_vec() }
+        Class { negated: true, ranges: ranges.to_vec().into_boxed_slice() }
     }
 
     syntax!(literal1, "a", vec![Literal('a')]);

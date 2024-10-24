@@ -280,14 +280,14 @@ type Fnv = hash::BuildHasherDefault<fnv::FnvHasher>;
 #[derive(Clone, Debug)]
 pub struct GlobSet {
     len: usize,
-    strats: Vec<GlobSetMatchStrategy>,
+    strats: Box<[GlobSetMatchStrategy]>,
 }
 
 impl GlobSet {
     /// Create an empty `GlobSet`. An empty set matches nothing.
     #[inline]
     pub fn empty() -> GlobSet {
-        GlobSet { len: 0, strats: vec![] }
+        GlobSet { len: 0, strats: Box::new([]) }
     }
 
     /// Returns true if this set is empty, and therefore matches nothing.
@@ -384,7 +384,7 @@ impl GlobSet {
 
     fn new(pats: &[Glob]) -> Result<GlobSet, Error> {
         if pats.is_empty() {
-            return Ok(GlobSet { len: 0, strats: vec![] });
+            return Ok(GlobSet { len: 0, strats: Box::new([]) });
         }
         let mut lits = LiteralStrategy::new();
         let mut base_lits = BasenameLiteralStrategy::new();
@@ -409,16 +409,20 @@ impl GlobSet {
                 }
                 MatchStrategy::Suffix { suffix, component } => {
                     if component {
-                        lits.add(i, suffix[1..].to_string());
+                        lits.add(i, suffix[1..].to_string().into_boxed_str());
                     }
                     suffixes.add(i, suffix);
                 }
                 MatchStrategy::RequiredExtension(ext) => {
-                    required_exts.add(i, ext, p.regex().to_owned());
+                    required_exts.add(
+                        i,
+                        ext,
+                        p.regex().to_owned().into_boxed_str(),
+                    );
                 }
                 MatchStrategy::Regex => {
                     debug!("glob converted to regex: {:?}", p);
-                    regexes.add(i, p.regex().to_owned());
+                    regexes.add(i, p.regex().to_owned().into_boxed_str());
                 }
             }
         }
@@ -445,7 +449,8 @@ impl GlobSet {
                     required_exts.build()?,
                 ),
                 GlobSetMatchStrategy::Regex(regexes.regex_set()?),
-            ],
+            ]
+            .into_boxed_slice(),
         })
     }
 }
@@ -558,15 +563,18 @@ impl GlobSetMatchStrategy {
 }
 
 #[derive(Clone, Debug)]
-struct LiteralStrategy(BTreeMap<Vec<u8>, Vec<usize>>);
+struct LiteralStrategy(BTreeMap<Box<[u8]>, Vec<usize>>);
 
 impl LiteralStrategy {
     fn new() -> LiteralStrategy {
         LiteralStrategy(BTreeMap::new())
     }
 
-    fn add(&mut self, global_index: usize, lit: String) {
-        self.0.entry(lit.into_bytes()).or_insert(vec![]).push(global_index);
+    fn add(&mut self, global_index: usize, lit: Box<str>) {
+        self.0
+            .entry(lit.into_boxed_bytes())
+            .or_insert(vec![])
+            .push(global_index);
     }
 
     fn is_match(&self, candidate: &Candidate) -> bool {
@@ -582,15 +590,18 @@ impl LiteralStrategy {
 }
 
 #[derive(Clone, Debug)]
-struct BasenameLiteralStrategy(BTreeMap<Vec<u8>, Vec<usize>>);
+struct BasenameLiteralStrategy(BTreeMap<Box<[u8]>, Vec<usize>>);
 
 impl BasenameLiteralStrategy {
     fn new() -> BasenameLiteralStrategy {
         BasenameLiteralStrategy(BTreeMap::new())
     }
 
-    fn add(&mut self, global_index: usize, lit: String) {
-        self.0.entry(lit.into_bytes()).or_insert(vec![]).push(global_index);
+    fn add(&mut self, global_index: usize, lit: Box<str>) {
+        self.0
+            .entry(lit.into_boxed_bytes())
+            .or_insert(vec![])
+            .push(global_index);
     }
 
     fn is_match(&self, candidate: &Candidate) -> bool {
@@ -612,15 +623,18 @@ impl BasenameLiteralStrategy {
 }
 
 #[derive(Clone, Debug)]
-struct ExtensionStrategy(HashMap<Vec<u8>, Vec<usize>, Fnv>);
+struct ExtensionStrategy(HashMap<Box<[u8]>, Vec<usize>, Fnv>);
 
 impl ExtensionStrategy {
     fn new() -> ExtensionStrategy {
         ExtensionStrategy(HashMap::with_hasher(Fnv::default()))
     }
 
-    fn add(&mut self, global_index: usize, ext: String) {
-        self.0.entry(ext.into_bytes()).or_insert(vec![]).push(global_index);
+    fn add(&mut self, global_index: usize, ext: Box<str>) {
+        self.0
+            .entry(ext.into_boxed_bytes())
+            .or_insert(vec![])
+            .push(global_index);
     }
 
     fn is_match(&self, candidate: &Candidate) -> bool {
@@ -644,7 +658,7 @@ impl ExtensionStrategy {
 #[derive(Clone, Debug)]
 struct PrefixStrategy {
     matcher: AhoCorasick,
-    map: Vec<usize>,
+    map: Box<[usize]>,
     longest: usize,
 }
 
@@ -672,7 +686,7 @@ impl PrefixStrategy {
 #[derive(Clone, Debug)]
 struct SuffixStrategy {
     matcher: AhoCorasick,
-    map: Vec<usize>,
+    map: Box<[usize]>,
     longest: usize,
 }
 
@@ -698,7 +712,7 @@ impl SuffixStrategy {
 }
 
 #[derive(Clone, Debug)]
-struct RequiredExtensionStrategy(HashMap<Vec<u8>, Vec<(usize, Regex)>, Fnv>);
+struct RequiredExtensionStrategy(HashMap<Box<[u8]>, Vec<(usize, Regex)>, Fnv>);
 
 impl RequiredExtensionStrategy {
     fn is_match(&self, candidate: &Candidate) -> bool {
@@ -736,7 +750,7 @@ impl RequiredExtensionStrategy {
 #[derive(Clone, Debug)]
 struct RegexSetStrategy {
     matcher: RegexSet,
-    map: Vec<usize>,
+    map: Box<[usize]>,
 }
 
 impl RegexSetStrategy {
@@ -753,9 +767,31 @@ impl RegexSetStrategy {
 
 #[derive(Clone, Debug)]
 struct MultiStrategyBuilder {
-    literals: Vec<String>,
+    literals: Vec<BoxStr>,
     map: Vec<usize>,
     longest: usize,
+}
+
+/// Encapsulation of `Box<str>` to provide an `AsRef<[u8]>` impl.
+#[derive(Clone, Debug)]
+struct BoxStr(Box<str>);
+
+impl From<Box<str>> for BoxStr {
+    fn from(value: Box<str>) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for BoxStr {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for BoxStr {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 
 impl MultiStrategyBuilder {
@@ -763,18 +799,18 @@ impl MultiStrategyBuilder {
         MultiStrategyBuilder { literals: vec![], map: vec![], longest: 0 }
     }
 
-    fn add(&mut self, global_index: usize, literal: String) {
+    fn add(&mut self, global_index: usize, literal: Box<str>) {
         if literal.len() > self.longest {
             self.longest = literal.len();
         }
         self.map.push(global_index);
-        self.literals.push(literal);
+        self.literals.push(literal.into());
     }
 
     fn prefix(self) -> PrefixStrategy {
         PrefixStrategy {
             matcher: AhoCorasick::new_auto_configured(&self.literals),
-            map: self.map,
+            map: self.map.into_boxed_slice(),
             longest: self.longest,
         }
     }
@@ -782,7 +818,7 @@ impl MultiStrategyBuilder {
     fn suffix(self) -> SuffixStrategy {
         SuffixStrategy {
             matcher: AhoCorasick::new_auto_configured(&self.literals),
-            map: self.map,
+            map: self.map.into_boxed_slice(),
             longest: self.longest,
         }
     }
@@ -790,14 +826,14 @@ impl MultiStrategyBuilder {
     fn regex_set(self) -> Result<RegexSetStrategy, Error> {
         Ok(RegexSetStrategy {
             matcher: new_regex_set(self.literals)?,
-            map: self.map,
+            map: self.map.into_boxed_slice(),
         })
     }
 }
 
 #[derive(Clone, Debug)]
 struct RequiredExtensionStrategyBuilder(
-    HashMap<Vec<u8>, Vec<(usize, String)>>,
+    HashMap<Box<[u8]>, Vec<(usize, Box<str>)>>,
 );
 
 impl RequiredExtensionStrategyBuilder {
@@ -805,9 +841,9 @@ impl RequiredExtensionStrategyBuilder {
         RequiredExtensionStrategyBuilder(HashMap::new())
     }
 
-    fn add(&mut self, global_index: usize, ext: String, regex: String) {
+    fn add(&mut self, global_index: usize, ext: Box<str>, regex: Box<str>) {
         self.0
-            .entry(ext.into_bytes())
+            .entry(ext.into_boxed_bytes())
             .or_insert(vec![])
             .push((global_index, regex));
     }
